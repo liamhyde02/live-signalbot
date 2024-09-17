@@ -4,9 +4,10 @@ import requests
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from slack_bolt.logger import logger
+from slack_bolt.logger import get_bolt_logger
+
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -14,12 +15,15 @@ load_dotenv()
 print(f"SLACK_BOT_TOKEN: {os.environ.get('SLACK_BOT_TOKEN')[:10]}...")
 print(f"SLACK_APP_TOKEN: {os.environ.get('SLACK_APP_TOKEN')[:10]}...")
 
+# Create a logger
+logger = get_bolt_logger(cls=logging.Logger)
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-# Update the API_BASE_URL to your Vercel-deployed FastAPI app
 API_BASE_URL = "https://live-db-kohl.vercel.app"
 
-# Function to call the API
+# Store conversation states
+conversation_states = {}
+
 def call_api(endpoint, method="GET", params=None, json=None):
     url = f"{API_BASE_URL}{endpoint}"
     headers = {"access_token": os.environ.get("API_KEY")}
@@ -31,128 +35,139 @@ def call_api(endpoint, method="GET", params=None, json=None):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        logger.error(f"API call failed: {str(e)}")
+        logger.error(f"API call failed: {str(e)}", exc_info=True)
         if hasattr(e, 'response') and e.response is not None:
-            logger.error(f"Response content: {e.response.content}")
+            logger.error(f"Response content: {e.response.content}", exc_info=True)
         raise
 
+def show_organizations(client, channel_id):
+    parameters = {"customer_organization_id": 1}
+    organizations = call_api("/organization/list", params=parameters)
+    org_list = "\n".join([f"{org['id']}: {org['name']}" for org in organizations])
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f"Here are the available organizations:\n{org_list}\n\nPlease reply with:\n"
+             f"- One or more organization IDs (comma-separated)\n"
+             f"- 'new' to create a new organization\n"
+             f"- 'none' to proceed without selecting any organizations"
+    )
+
 @app.command("/add_signal")
-def handle_add_signal_command(ack, say, command):
+def handle_add_signal_command(ack, say, command, client):
     ack()
     try:
-        # Fetch organizations
-        organizations = call_api("/organizations/list")
-        org_list = "\n".join([f"{org['id']}: {org['name']}" for org in organizations])
-        say(f"Here are the available organizations:\n{org_list}\n\nPlease reply with an organization ID or 'new' to create a new organization.")
+        dm = client.conversations_open(users=[command['user_id']])
+        dm_channel_id = dm['channel']['id']
+        
+        show_organizations(client, dm_channel_id)
+        
+        conversation_states[command['user_id']] = {
+            'state': 'awaiting_org_selection',
+            'dm_channel_id': dm_channel_id,
+            'selected_org_ids': []
+        }
     except Exception as e:
-        say(f"Error fetching organizations: {str(e)}")
+        say(f"Error starting signal addition process: {str(e)}", ephemeral=True)
 
-@app.message("new")
-def handle_new_organization(message, say):
-    say("Please enter the name for the new organization:")
-
-@app.message(r"^\d+$")
-def handle_organization_selection(message, say):
-    org_id = message['text']
-    say(f"You've selected organization ID: {org_id}. Please enter the signal text:")
-
-@app.message()
-def handle_user_input(message, say, client):
-    channel_id = message['channel']
-    thread_ts = message.get('thread_ts', message['ts'])
+@app.event("message")
+def handle_message(event, say, client):
+    user_id = event.get('user')
+    channel_id = event.get('channel')
     
-    # Fetch conversation history
-    result = client.conversations_replies(channel=channel_id, ts=thread_ts)
-    messages = result['messages']
-    
-    if len(messages) == 2:  # New organization name
-        org_name = message['text']
-        try:
-            new_org = call_api("/organizations/create", method="POST", json={"name": org_name})
-            say(f"New organization '{org_name}' created with ID: {new_org['organization_id']}. Please enter the signal text:")
-        except Exception as e:
-            say(f"Error creating new organization: {str(e)}")
-    elif len(messages) == 3:  # Signal text
-        signal_text = message['text']
-        org_id = messages[1]['text']
-        try:
-            # Assuming you have an endpoint to add a signal
-            signal_response = call_api("/signals/create", method="POST", json={"organization_id": org_id, "signal": signal_text})
-            say(f"Signal added successfully: {signal_response}")
-        except Exception as e:
-            say(f"Error adding signal: {str(e)}")
-    else:
-        say("I'm not sure how to process that. Please start over with the /add_signal command.")
+    if not user_id or not channel_id:
+        return
 
+    channel_info = client.conversations_info(channel=channel_id)
+    if not channel_info['channel']['is_im']:
+        return
 
-@app.command("/hello")
-def handle_hello_command(ack, say):
-    ack()
-    say("Hello! I'm your Slack bot connected to the livePM database via Vercel.")
-    logging.debug("/hello command was triggered")
+    if user_id not in conversation_states:
+        client.chat_postMessage(
+            channel=channel_id,
+            text="To start adding a signal, please use the /add_signal command in a channel where the bot is present."
+        )
+        return
 
-@app.command("/get_vision")
-def handle_get_vision_command(ack, say, command):
-    ack()
-    try:
-        response = call_api("/vision")
-        say(f"Vision: {response['data']['vision']}")
-    except Exception as e:
-        say(f"Error fetching vision: {str(e)}")
-    logging.debug("/get_vision command was triggered")
+    state = conversation_states[user_id]['state']
+    text = event['text'].strip()
 
-@app.command("/get_mission")
-def handle_get_mission_command(ack, say, command):
-    ack()
-    try:
-        response = call_api("/mission")
-        say(f"Mission: {response['data']['mission']}")
-    except Exception as e:
-        say(f"Error fetching mission: {str(e)}")
-    logging.debug("/get_mission command was triggered")
-
-@app.command("/list_users")
-def handle_list_users_command(ack, say, command):
-    ack()
-    try:
-        # Parse the customer_organization_id from the command text
-        cmd_parts = command['text'].split()
-        if len(cmd_parts) > 0 and cmd_parts[0].isdigit():
-            customer_org_id = int(cmd_parts[0])
+    if state == 'awaiting_org_selection':
+        if text.lower() == 'new':
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Please enter the name for the new organization:"
+            )
+            conversation_states[user_id]['state'] = 'awaiting_new_org_name'
+        elif text.lower() == 'none':
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Proceeding without selecting any organizations. Please enter the signal text:"
+            )
+            conversation_states[user_id]['state'] = 'awaiting_signal'
+        elif all(org_id.strip().isdigit() for org_id in text.split(',')):
+            org_ids = [int(org_id.strip()) for org_id in text.split(',')]
+            conversation_states[user_id]['selected_org_ids'].extend(org_ids)
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"You've selected organization ID(s): {', '.join(map(str, org_ids))}. Please enter the signal text:"
+            )
+            conversation_states[user_id]['state'] = 'awaiting_signal'
         else:
-            customer_org_id = 1  # Default to 1 if no valid ID is provided
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Invalid input. Please enter valid organization ID(s) (comma-separated), 'new', or 'none'."
+            )
 
-        params = {"customer_organization_id": customer_org_id}
-        response = call_api("/user/list", params=params)
-        users = response
+    elif state == 'awaiting_new_org_name':
+        try:
+            new_org = call_api("/organization/create", method="POST", json={"name": text, "Customer_Organization_id": 1})
+            org_id = new_org['organization_id']
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"New organization '{text}' created with ID: {org_id}."
+            )
+            show_organizations(client, channel_id)
+            conversation_states[user_id]['state'] = 'awaiting_org_selection'
+        except Exception as e:
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Error creating new organization: {str(e)}"
+            )
 
-        if users:
-            user_list = "\n".join([f"- ID: {user['id']}, Name: {user['name']}" for user in users])
-            say(f"Users for Customer Organization {customer_org_id}:\n{user_list}")
-        else:
-            say(f"No users found for Customer Organization {customer_org_id}.")
+    elif state == 'awaiting_signal':
+        try:
+            org_ids = conversation_states[user_id]['selected_org_ids']
+            signal_response = call_api("/signal/create", method="POST", json={
+                "signal": text,
+                "organization_ids": org_ids,
+                "user_id": 1,
+                "source": "Slack",
+                "type": "manual"
+            })
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Signal added successfully: {signal_response}"
+            )
+            del conversation_states[user_id]  # Clear the conversation state
+        except Exception as e:
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Error adding signal: {str(e)}"
+            )
+
+@app.command("/help")
+def handle_help_command(ack, say, command, client):
+    ack()
+    try:
+        client.chat_postMessage(
+            channel=command['channel_id'],
+            text="I can respond to the following commands:\n"
+                 "- /add_signal: Start adding a signal to a customer organization\n"
+                 "- /help: Show this help message"
+        )
     except Exception as e:
-        error_message = f"Error fetching users: {str(e)}"
-        logger.error(error_message)
-        say(error_message)
-    logger.debug(f"/list_users command was triggered for org ID: {customer_org_id}")
-
-
-@app.message("help")
-def handle_help_message(message, say):
-    say("I can respond to the following commands:\n"
-        "- /hello: Say hello\n"
-        "- /get_vision: Get the company vision\n"
-        "- /get_mission: Get the company mission\n"
-        "- /list_users: Get a list of users for Customer Organization 1\n"
-        "- help: Show this help message")
-    logging.debug("help message was triggered")
-
-@app.event("app_mention")
-def handle_app_mention(event, say):
-    say(f"Hi there, <@{event['user']}>! You can use /hello, /get_vision, /get_mission, or /list_users to interact with me.")
-    logging.debug(f"Bot was mentioned by user {event['user']}")
-
+        logger.error(f"Error sending help message: {str(e)}", exc_info=True)
+        
 if __name__ == "__main__":
     handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
     handler.start()
