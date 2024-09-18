@@ -1,5 +1,5 @@
 from config import conversation_states
-from api_client import call_api
+from api_client import call_api, get_customer_org_id
 from utils import show_organizations, show_users
 
 def handle_org_selection(user_id, channel_id, text, client):
@@ -132,31 +132,49 @@ def handle_new_user_name(user_id, channel_id, text, client):
             "name": text,
             "Customer_Organization_id": conversation_states[user_id]['customer_org_id']
         })
-        user_id = new_user['user_id']
-        register_response = call_api("/user/register", method="POST", json={
-            "slack_id": str(conversation_states[user_id]['slack_id']),
-            "user_id": user_id
-        })
-        client.chat_postMessage(
-            channel=channel_id,
-            text=f"New user '{text}' created with ID: {user_id} and user registration successful."
-        )
-        
-        if 'pending_signal' in conversation_states[user_id]:
-            pending_signal = conversation_states[user_id]['pending_signal']
-            signal_response = call_api("/signal/create", method="POST", json={
-                "signal": pending_signal['text'],
-                "organization_ids": pending_signal['org_ids'],
-                "user_id": user_id,
-                "source": "Slack",
-                "type": "manual"
+        if new_user and 'user_id' in new_user:
+            created_user_id = new_user['user_id']
+            register_response = call_api("/user/register", method="POST", params={
+                "slack_id": str(conversation_states[user_id]['slack_id']),
+                "user_id": created_user_id
             })
+            if register_response is not None:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"New user '{text}' created with ID: {created_user_id} and user registration successful."
+                )
+                
+                if 'pending_signal' in conversation_states[user_id]:
+                    pending_signal = conversation_states[user_id]['pending_signal']
+                    signal_response = call_api("/signal/create", method="POST", json={
+                        "signal": pending_signal['text'],
+                        "organization_ids": pending_signal['org_ids'],
+                        "user_id": created_user_id,
+                        "source": "Slack",
+                        "type": "manual"
+                    })
+                    if signal_response is not None:
+                        client.chat_postMessage(
+                            channel=channel_id,
+                            text=f"Pending signal added successfully: {signal_response}"
+                        )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel_id,
+                            text="Failed to add pending signal. Please try adding the signal again."
+                        )
+                
+                del conversation_states[user_id]  # Clear the conversation state
+            else:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text="User created but registration failed. Please try registering again using the /register_user command."
+                )
+        else:
             client.chat_postMessage(
                 channel=channel_id,
-                text=f"Pending signal added successfully: {signal_response}"
+                text="Failed to create new user. Please try again or contact support."
             )
-        
-        del conversation_states[user_id]  # Clear the conversation state
     except Exception as e:
         client.chat_postMessage(
             channel=channel_id,
@@ -173,10 +191,10 @@ def handle_customer_org_selection(user_id, channel_id, text, client):
     elif text.isdigit():
         try:
             register_response = call_api("/customerorganization/register", method="POST", params={
-                "slack_id": conversation_states[user_id]['team_id'],
+                "slack_id": str(conversation_states[user_id]['team_id']),
                 "customer_organization_id": int(text)
             })
-            if register_response:
+            if register_response is not None:
                 client.chat_postMessage(
                     channel=channel_id,
                     text=f"Customer organization registration successful. Your Slack workspace has been linked to customer organization ID {text}."
@@ -203,16 +221,28 @@ def handle_new_customer_org_name(user_id, channel_id, text, client):
         new_org = call_api("/customerorganization/create", method="POST", json={
             "name": text
         })
-        org_id = new_org['customerorganization_id']
-        register_response = call_api("/customerorganization/register", method="POST", json={
-            "slack_id": str(conversation_states[user_id]['team_id']),
-            "customer_organization_id": org_id
-        })
-        client.chat_postMessage(
-            channel=channel_id,
-            text=f"New customer organization '{text}' created with ID: {org_id} and registered with your Slack workspace."
-        )
-        del conversation_states[user_id]  # Clear the conversation state
+        if new_org and 'customerorganization_id' in new_org:
+            org_id = new_org['customerorganization_id']
+            register_response = call_api("/customerorganization/register", method="POST", params={
+                "slack_id": str(conversation_states[user_id]['team_id']),
+                "customer_organization_id": org_id
+            })
+            if register_response is not None:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"New customer organization '{text}' created with ID: {org_id} and registered with your Slack workspace."
+                )
+                del conversation_states[user_id]  # Clear the conversation state
+            else:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text="Customer organization created but registration failed. Please try registering again using the /register_organization command."
+                )
+        else:
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Failed to create new customer organization. Please try again or contact support."
+            )
     except Exception as e:
         client.chat_postMessage(
             channel=channel_id,

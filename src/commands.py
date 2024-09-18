@@ -57,7 +57,8 @@ def register_commands(app):
         try:
             team_id = command['team_id']
             customer_org_id = get_customer_org_id(team_id)
-            if customer_org_id:
+            
+            if customer_org_id is not None:
                 say(f"Your Slack workspace is already registered with customer organization ID: {customer_org_id}")
                 return
 
@@ -73,7 +74,7 @@ def register_commands(app):
             }
         except Exception as e:
             say(f"Error starting organization registration process: {str(e)}", ephemeral=True)
-
+    
     @app.command("/help")
     def handle_help_command(ack, say, command, client):
         ack()
