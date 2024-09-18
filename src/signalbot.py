@@ -31,7 +31,10 @@ def call_api(endpoint, method="GET", params=None, json=None):
         if method == "GET":
             response = requests.get(url, params=params, headers=headers)
         elif method == "POST":
-            response = requests.post(url, json=json, headers=headers)
+            if json:
+                response = requests.post(url, json=json, headers=headers)
+            else:
+                response = requests.post(url, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -52,6 +55,17 @@ def show_organizations(client, channel_id):
              f"- 'none' to proceed without selecting any organizations"
     )
 
+def show_users(client, channel_id):
+    parameters = {"customer_organization_id": 1}  # Adjust this if needed
+    users = call_api("/user/list", params=parameters)
+    user_list = "\n".join([f"{user['id']}: {user['name']}" for user in users])
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f"Here are the available users:\n{user_list}\n\nPlease reply with:\n"
+             f"- An existing user ID\n"
+             f"- 'new' to create a new user"
+    )
+
 @app.command("/add_signal")
 def handle_add_signal_command(ack, say, command, client):
     ack()
@@ -69,6 +83,23 @@ def handle_add_signal_command(ack, say, command, client):
     except Exception as e:
         say(f"Error starting signal addition process: {str(e)}", ephemeral=True)
 
+@app.command("/register_slack")
+def handle_register_slack_command(ack, say, command, client):
+    ack()
+    try:
+        dm = client.conversations_open(users=[command['user_id']])
+        dm_channel_id = dm['channel']['id']
+        
+        show_users(client, dm_channel_id)
+        
+        conversation_states[command['user_id']] = {
+            'state': 'awaiting_user_selection',
+            'dm_channel_id': dm_channel_id,
+            'slack_id': command['user_id']
+        }
+    except Exception as e:
+        say(f"Error starting Slack registration process: {str(e)}", ephemeral=True)
+
 @app.event("message")
 def handle_message(event, say, client):
     user_id = event.get('user')
@@ -84,7 +115,7 @@ def handle_message(event, say, client):
     if user_id not in conversation_states:
         client.chat_postMessage(
             channel=channel_id,
-            text="To start adding a signal, please use the /add_signal command in a channel where the bot is present."
+            text="To start adding a signal, use the /add_signal command. To register with Slack, use the /register_slack command."
         )
         return
 
@@ -137,22 +168,130 @@ def handle_message(event, say, client):
     elif state == 'awaiting_signal':
         try:
             org_ids = conversation_states[user_id]['selected_org_ids']
-            signal_response = call_api("/signal/create", method="POST", json={
-                "signal": text,
-                "organization_ids": org_ids,
-                "user_id": 1,
-                "source": "Slack",
-                "type": "manual"
-            })
-            client.chat_postMessage(
-                channel=channel_id,
-                text=f"Signal added successfully: {signal_response}"
-            )
-            del conversation_states[user_id]  # Clear the conversation state
+            user_response = call_api("/user/slack", method="GET", params={"slack_id": str(user_id)})
+            if 'user_id' not in user_response:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text="It looks like your Slack ID is not registered. Let's get you registered first."
+                )
+                show_users(client, channel_id)
+                conversation_states[user_id] = {
+                    'state': 'awaiting_user_selection',
+                    'dm_channel_id': channel_id,
+                    'slack_id': user_id,
+                    'pending_signal': {
+                        'text': text,
+                        'org_ids': org_ids
+                    }
+                }
+            else:
+                signal_response = call_api("/signal/create", method="POST", json={
+                    "signal": text,
+                    "organization_ids": org_ids,
+                    "user_id": user_response['user_id'],
+                    "source": "Slack",
+                    "type": "manual"
+                })
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Signal added successfully: {signal_response}"
+                )
+                del conversation_states[user_id]  # Clear the conversation state
         except Exception as e:
             client.chat_postMessage(
                 channel=channel_id,
                 text=f"Error adding signal: {str(e)}"
+            )
+
+    elif state == 'awaiting_user_selection':
+        if text.lower() == 'new':
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Please enter the name for the new user:"
+            )
+            conversation_states[user_id]['state'] = 'awaiting_new_user_name'
+        elif text.isdigit():
+            try:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Registering Slack ID {conversation_states[user_id]['slack_id']} with user ID {text}..."
+                )
+                register_response = call_api("/user/register", method="POST", params={
+                    "slack_id": str(conversation_states[user_id]['slack_id']),
+                    "user_id": int(text)
+                })
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Slack registration successful. Your Slack ID {conversation_states[user_id]['slack_id']} has been linked to user ID {text}."
+                )
+                
+                # Check if there's a pending signal
+                if 'pending_signal' in conversation_states[user_id]:
+                    pending_signal = conversation_states[user_id]['pending_signal']
+                    signal_response = call_api("/signal/create", method="POST", json={
+                        "signal": pending_signal['text'],
+                        "organization_ids": pending_signal['org_ids'],
+                        "user_id": int(text),
+                        "source": "Slack",
+                        "type": "manual"
+                    })
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"Pending signal added successfully: {signal_response}"
+                    )
+                
+                del conversation_states[user_id]  # Clear the conversation state
+            except Exception as e:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Error registering Slack ID: {str(e)}"
+                )
+        else:
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Invalid input. Please enter a valid user ID or 'new' to create a new user."
+            )
+
+    elif state == 'awaiting_new_user_name':
+        try:
+            new_user = call_api("/user/create", method="POST", json={
+                "name": text,
+                "Customer_Organization_id": 1  # Adjust this if needed
+            })
+            user_id = new_user['user_id']
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"New user '{text}' created with ID: {user_id}. Now registering your Slack ID..."
+            )
+            register_response = call_api("/user/register", method="POST", params={
+                "slack_id": str(conversation_states[user_id]['slack_id']),
+                "user_id": user_id
+            })
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Slack registration successful. Your Slack ID {conversation_states[user_id]['slack_id']} has been linked to the new user ID {user_id}."
+            )
+            
+            # Check if there's a pending signal
+            if 'pending_signal' in conversation_states[user_id]:
+                pending_signal = conversation_states[user_id]['pending_signal']
+                signal_response = call_api("/signal/create", method="POST", json={
+                    "signal": pending_signal['text'],
+                    "organization_ids": pending_signal['org_ids'],
+                    "user_id": user_id,
+                    "source": "Slack",
+                    "type": "manual"
+                })
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"Pending signal added successfully: {signal_response}"
+                )
+            
+            del conversation_states[user_id]  # Clear the conversation state
+        except Exception as e:
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Error creating new user and registering Slack ID: {str(e)}"
             )
 
 @app.command("/help")
@@ -163,6 +302,7 @@ def handle_help_command(ack, say, command, client):
             channel=command['channel_id'],
             text="I can respond to the following commands:\n"
                  "- /add_signal: Start adding a signal to a customer organization\n"
+                 "- /register_slack: Register your Slack ID with your user account\n"
                  "- /help: Show this help message"
         )
     except Exception as e:
